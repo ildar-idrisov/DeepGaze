@@ -2,6 +2,10 @@
 
 This repository contains the pytorch implementations of DeepGaze I, DeepGaze II, DeepGaze IIE, DeepGaze III, and DeepGaze MSDB
 
+Note: Some DeepGaze variants have their own repositories:
+- [DeepGaze MR, a video saliency baseline model (ECCV 2020)](https://github.com/mtangemann/deepgazemr)
+- [DeepGaze3.5-VL, our newest SOTA scanpath model (ECCV 2026)](https://github.com/Susmit-A/DeepGaze3.5-VL)
+
 ## Examples
 
 Below you can see some example uses of the models. For more details, check out [Examples.ipynb]
@@ -140,6 +144,7 @@ axs[1].set_axis_off()
 The figure shows on the left the viewed image with the previous scanpath fixations superimposed and a yellow dot indicating the location of the current fixtion. On the right, the predicted log density for the next fixation location is displayed, again together with the previous scanpath:
 
 ![Plot with viewed image and predicted log density](figures/deepgaze3_prediction.png)
+
 
 
 
