@@ -51,6 +51,28 @@ _READOUT_FACTOR = 8
 _SALIENCY_MAP_FACTOR = 2
 
 
+def _freeze_all_but_new_slot(params, new_index):
+    """Register backward hooks so only the newly added dataset slot receives gradients.
+
+    The new slot is always the last column, appended at ``new_index`` (the model's width
+    before the append). Its index is NOT necessarily equal to ``n_generalization_datasets``
+    -- they differ when adapting with ``n_generalization_datasets`` smaller than the current
+    width, or on a second ``add_dataset()`` call -- so the mask must key on ``new_index``.
+    Every earlier column (all original datasets and any previously added slots) is frozen.
+    The dataset axis is the last axis of each per-dataset tensor, so ``[..., :new_index]``
+    selects everything but the new slot for both the 2D scale-weight tensors and the 1D
+    finalizer tensors.
+    """
+    def _make_mask(keep):
+        def _mask(grad):
+            grad = grad.clone()
+            grad[..., :keep] = 0
+            return grad
+        return _mask
+    for param in params:
+        param.register_hook(_make_mask(new_index))
+
+
 def _build_saliency_network(input_channels: int) -> nn.Sequential:
     """Build the saliency network.
 
@@ -96,12 +118,25 @@ class _DatasetAwareGaussianFilter(nn.Module):
             torch.ones(n_datasets, dtype=torch.float32) * sigma,
             requires_grad=True
         )
+        # number of original (generalization) datasets to average over when dataset=None;
+        # None means "all", preserving the pretrained behaviour. Set by add_dataset.
+        self.n_generalization_datasets = None
+
+    def add_dataset(self, n_generalization_datasets):
+        """Append a sigma slot initialised to the mean of the original datasets' sigmas."""
+        with torch.no_grad():
+            new_sigma = self.dataset_sigmas.data[:n_generalization_datasets].mean().reshape(1)
+        self.dataset_sigmas = nn.Parameter(torch.cat([self.dataset_sigmas.data, new_sigma]))
+        self.n_generalization_datasets = n_generalization_datasets
+        return self.dataset_sigmas.shape[0] - 1
 
     def forward(self, tensor: torch.Tensor, scaling_factors: List[float],
                 dataset_indices: Optional[torch.Tensor]) -> torch.Tensor:
         if dataset_indices is None:
-            # Average over all datasets
-            sigma = self.dataset_sigmas.mean()
+            # Average over the original (generalization) datasets only
+            n = self.n_generalization_datasets
+            source = self.dataset_sigmas if n is None else self.dataset_sigmas[:n]
+            sigma = source.mean()
             sigmas = [sigma for _ in range(tensor.shape[0])]
         else:
             sigmas = self.dataset_sigmas[dataset_indices]
@@ -129,6 +164,43 @@ class _DatasetAwareFinalizer(nn.Module):
         self.gauss = _DatasetAwareGaussianFilter([2, 3], sigma, n_datasets=n_datasets, truncate=3)
         self.dataset_center_bias_weights = nn.Parameter(torch.ones(n_datasets), requires_grad=True)
         self.dataset_priority_scalings = nn.Parameter(torch.zeros(n_datasets), requires_grad=True)
+        # number of original (generalization) datasets to average over when dataset=None;
+        # None means "all", preserving the pretrained behaviour. Set by add_dataset.
+        self.n_generalization_datasets = None
+
+    def add_dataset(self, n_generalization_datasets):
+        """Append a per-dataset slot initialised from the original datasets so that
+        ``forward(..., dataset_indices=[new])`` reproduces the ``dataset_indices=None``
+        (averaged) prediction, while leaving the original datasets' predictions unchanged.
+        """
+        g = slice(0, n_generalization_datasets)
+        with torch.no_grad():
+            new_cbw = self.dataset_center_bias_weights.data[g].mean().reshape(1)
+            new_pri = self.dataset_priority_scalings.data[g].mean().reshape(1)
+        self.dataset_center_bias_weights = nn.Parameter(
+            torch.cat([self.dataset_center_bias_weights.data, new_cbw]))
+        self.dataset_priority_scalings = nn.Parameter(
+            torch.cat([self.dataset_priority_scalings.data, new_pri]))
+        # freeze the priority reference at the original-datasets mean so old slots stay fixed
+        self.set_priority_reference(self.dataset_priority_scalings.data[g].mean())
+        self.gauss.add_dataset(n_generalization_datasets)
+        self.n_generalization_datasets = n_generalization_datasets
+        return self.dataset_priority_scalings.shape[0] - 1
+
+    def set_priority_reference(self, value):
+        """Freeze the reference used to mean-center the priority scalings.
+
+        The priority scaling of a dataset is applied as ``exp(p_d - reference)``. Normally
+        ``reference`` is the live ``mean(p)``, which couples all datasets. Freezing it to a
+        fixed value (the original-datasets mean, set by ``add_dataset``) decouples the slots so
+        that training a newly added dataset leaves the pretrained datasets' predictions
+        unchanged.
+        """
+        value = torch.as_tensor(value, dtype=self.dataset_priority_scalings.dtype)
+        if 'priority_scaling_reference' in self._buffers:
+            self.priority_scaling_reference = value
+        else:
+            self.register_buffer('priority_scaling_reference', value)
 
     def forward(self, readout: torch.Tensor, centerbias: torch.Tensor,
                 scaling_factors: List[float], dataset_indices: Optional[torch.Tensor]) -> torch.Tensor:
@@ -144,8 +216,14 @@ class _DatasetAwareFinalizer(nn.Module):
 
         # Apply priority scaling
         if dataset_indices is not None:
-            # Normalize w.r.t geometric mean to make numbers comparable
-            dataset_priority_scalings_mean_log = torch.mean(self.dataset_priority_scalings)
+            # Normalize w.r.t geometric mean to make numbers comparable. When a fixed reference
+            # has been set (after add_dataset), use it instead of the live mean so that adding
+            # and training new dataset slots does not shift the pretrained datasets.
+            reference = getattr(self, 'priority_scaling_reference', None)
+            if reference is not None:
+                dataset_priority_scalings_mean_log = reference
+            else:
+                dataset_priority_scalings_mean_log = torch.mean(self.dataset_priority_scalings)
             dataset_priority_scalings = torch.exp(self.dataset_priority_scalings - dataset_priority_scalings_mean_log)
             priority_scalings = dataset_priority_scalings[dataset_indices].view(-1, 1, 1)
         else:
@@ -157,7 +235,9 @@ class _DatasetAwareFinalizer(nn.Module):
         if dataset_indices is not None:
             centerbias_weights = self.dataset_center_bias_weights[dataset_indices].view(-1, 1, 1)
         else:
-            centerbias_weight = self.dataset_center_bias_weights.mean()
+            n = self.n_generalization_datasets
+            source = self.dataset_center_bias_weights if n is None else self.dataset_center_bias_weights[:n]
+            centerbias_weight = source.mean()
             centerbias_weights = centerbias_weight.view(1, 1, 1)
 
         out = out + centerbias_weights * downscaled_centerbias
@@ -204,6 +284,26 @@ class _MultiScaleBackbone(nn.Module):
             torch.zeros((len(resolutions_size), n_datasets)),
             requires_grad=True
         )
+        # number of original (generalization) datasets to average over when dataset_index=None;
+        # None means "all", preserving the pretrained behaviour. Set by add_dataset.
+        self.n_generalization_datasets = None
+
+    def add_dataset(self, n_generalization_datasets):
+        """Append a per-dataset weight column to both scale-weight tensors, initialised so the
+        normalised scale weights of the new column equal the ``dataset_index=None`` average of
+        the original datasets. The weights live in log space and are averaged as
+        ``exp(w).mean(dim=1)`` in the None branch, so the new column is initialised to
+        ``logsumexp(w[:, :n], dim=1) - log(n)`` (the log of the arithmetic mean of ``exp(w)``).
+        """
+        def _widen(param):
+            with torch.no_grad():
+                new_col = (torch.logsumexp(param.data[:, :n_generalization_datasets], dim=1)
+                           - math.log(n_generalization_datasets)).unsqueeze(1)
+            return nn.Parameter(torch.cat([param.data, new_col], dim=1))
+        self.pixel_per_dva_weights = _widen(self.pixel_per_dva_weights)
+        self.size_weights = _widen(self.size_weights)
+        self.n_generalization_datasets = n_generalization_datasets
+        return self.pixel_per_dva_weights.shape[1] - 1
 
     def _process_pixel_per_dva(self, x: torch.Tensor, image_pixel_per_dvas: List[float],
                                 target_pixel_per_dva: float, readout_shape: List[int]) -> torch.Tensor:
@@ -257,10 +357,13 @@ class _MultiScaleBackbone(nn.Module):
         size_weights = torch.exp(self.size_weights)
 
         if dataset_index is None:
-            # Average weights across all datasets
+            # Average weights across the original (generalization) datasets only
             dataset_index = torch.zeros(orig_shape[0], dtype=torch.long, device=x.device)
-            pixel_per_dva_weights = pixel_per_dva_weights.mean(dim=1, keepdim=True)
-            size_weights = size_weights.mean(dim=1, keepdim=True)
+            n = self.n_generalization_datasets
+            ppd_source = pixel_per_dva_weights if n is None else pixel_per_dva_weights[:, :n]
+            size_source = size_weights if n is None else size_weights[:, :n]
+            pixel_per_dva_weights = ppd_source.mean(dim=1, keepdim=True)
+            size_weights = size_source.mean(dim=1, keepdim=True)
 
         # Normalize weights to sum to 1
         weight_sum = pixel_per_dva_weights.sum(dim=0, keepdim=True) + size_weights.sum(dim=0, keepdim=True)
@@ -453,8 +556,65 @@ class DeepGazeMSDB(nn.Module):
 
         return x
 
+    def add_dataset(self, n_generalization_datasets: Optional[int] = None) -> int:
+        """Add a new dataset slot for adapting the model to a new dataset.
+
+        Appends one per-dataset parameter slot (13 scalars total: 5 pixel-per-dva scale
+        weights, 5 size scale weights, 1 gaussian sigma, 1 center-bias weight, 1 priority
+        scaling), initialised from the mean of the original ``n_generalization_datasets``
+        datasets so that ``model(image, centerbias, pixel_per_dva, dataset=new_index)``
+        reproduces the averaged ``dataset=None`` prediction at initialisation. The saliency
+        network and backbone are frozen, and gradient masking is installed so that only the
+        new slot trains -- the original datasets' predictions stay unchanged. The new slot
+        index is returned; use it for training and evaluation.
+
+        Note: an adapted checkpoint's per-dataset tensors are one column wider than the
+        released model's, so reloading one requires calling ``add_dataset`` before
+        ``load_state_dict``.
+        """
+        if n_generalization_datasets is None:
+            n_generalization_datasets = _N_DATASETS
+        n = int(n_generalization_datasets)
+
+        idx_a = self.features.add_dataset(n)
+        idx_b = self.finalizer.add_dataset(n)
+        assert idx_a == idx_b, (idx_a, idx_b)
+
+        # Freeze everything except the per-dataset parameters
+        for param in self.saliency_network.parameters():
+            param.requires_grad = False
+        for param in self.features.backbone.parameters():
+            param.requires_grad = False
+
+        # Mask gradients so only the new slot trains (all earlier slots stay frozen). The new
+        # slot is the last column (idx_a), which is NOT necessarily `n` -- see the helper.
+        _freeze_all_but_new_slot(self.dataset_parameters(), idx_a)
+
+        return idx_a
+
+    def dataset_parameters(self):
+        """The five per-dataset parameter tensors (the only ones trained during adaptation)."""
+        return [
+            self.features.pixel_per_dva_weights,
+            self.features.size_weights,
+            self.finalizer.gauss.dataset_sigmas,
+            self.finalizer.dataset_center_bias_weights,
+            self.finalizer.dataset_priority_scalings,
+        ]
+
+    def head_state_dict(self):
+        """State dict without the frozen CLIP/DINOv2 backbone.
+
+        Matches the released ``deepgazemsdb.pth`` format (head only). Load into a
+        ``DeepGazeMSDB`` with ``strict=False``; for an adapted model call ``add_dataset``
+        first so the per-dataset tensor shapes match.
+        """
+        return {k: v for k, v in self.state_dict().items()
+                if not k.startswith('features.backbone')}
+
     def train(self, mode: bool = True):
         """Set training mode, keeping backbone frozen."""
         self.features.train(mode=mode)
         self.saliency_network.train(mode=mode)
         self.finalizer.train(mode=mode)
+        return self
