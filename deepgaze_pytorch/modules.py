@@ -201,9 +201,10 @@ class DeepGazeII(torch.nn.Module):
         return x
 
     def train(self, mode=True):
+        super().train(mode=mode)
+        # the backbone is frozen: keep its BatchNorm layers on their running statistics
         self.features.eval()
-        self.readout_network.train(mode=mode)
-        self.finalizer.train(mode=mode)
+        return self
 
 
 class DeepGazeIII(torch.nn.Module):
@@ -257,12 +258,10 @@ class DeepGazeIII(torch.nn.Module):
         return x
 
     def train(self, mode=True):
+        super().train(mode=mode)
+        # the backbone is frozen: keep its BatchNorm layers on their running statistics
         self.features.eval()
-        self.saliency_network.train(mode=mode)
-        if self.scanpath_network is not None:
-            self.scanpath_network.train(mode=mode)
-        self.fixation_selection_network.train(mode=mode)
-        self.finalizer.train(mode=mode)
+        return self
 
 
 class DeepGazeIIIMixture(torch.nn.Module):
@@ -327,6 +326,12 @@ class DeepGazeIIIMixture(torch.nn.Module):
         prediction = predictions.logsumexp(dim=(1), keepdim=True)
 
         return prediction
+
+    def train(self, mode=True):
+        super().train(mode=mode)
+        # the backbone is frozen: keep its BatchNorm layers on their running statistics
+        self.features.eval()
+        return self
 
 
 class MixtureModel(torch.nn.Module):

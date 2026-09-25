@@ -6,6 +6,16 @@ Note: Some DeepGaze variants have their own repositories:
 - [DeepGaze MR, a video saliency baseline model (ECCV 2020)](https://github.com/mtangemann/deepgazemr)
 - [DeepGaze3.5-VL, our newest SOTA scanpath model (ECCV 2026)](https://github.com/Susmit-A/DeepGaze3.5-VL)
 
+## Installation
+
+```bash
+pip install .              # DeepGaze I, IIE, III
+pip install .[msdb]        # + CLIP, needed for DeepGaze MSDB
+pip install .[training]    # + dependencies of the training / adaptation code
+```
+
+The tests run with `python -m pytest tests` (requires the `training` extras and pytest).
+
 ## Examples
 
 Below you can see some example uses of the models. For more details, check out [Examples.ipynb]

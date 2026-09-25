@@ -396,6 +396,7 @@ class _MultiScaleBackbone(nn.Module):
         super().train(mode=mode)
         # Keep backbone frozen
         self.backbone.eval()
+        return self
 
 
 class _BackboneConcatenator(nn.Module):
